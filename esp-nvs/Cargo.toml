@@ -24,7 +24,11 @@ esp32h2 = ["dep:esp-storage", "esp-storage/esp32h2", "dep:esp-hal", "esp-hal/esp
 strum = { version = "0.27.1", default-features = false, features = ["derive"] }
 embedded-storage = "0.3.1"
 defmt = { version = "1.0.1", optional = true }
-esp-storage = { version = ">=0.8.1, <0.10", optional = true }
+# Raised from ">=0.8.1, <0.10" so esp-hal 1.2 consumers can build:
+# esp-storage 0.9 pins esp-hal ~1.1 and 0.10 pins esp-hal ~1.2.
+# 0.10 also made the embedded-storage trait impls opt-in, and this
+# crate needs `FlashStorage: NorFlash`, so request that feature here.
+esp-storage = { version = ">=0.10, <0.11", optional = true, features = ["embedded-storage"] }
 esp-hal = { version = ">=1.0.0, <2", optional = true }
 thiserror = { version = "2.0.0", default-features = false }
 
