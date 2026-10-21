@@ -4,11 +4,6 @@
 //! the in-memory page structures during [`Nvs`](crate::Nvs) startup.
 
 use alloc::vec;
-use alloc::vec::Vec;
-use core::mem::{
-    offset_of,
-    size_of,
-};
 use core::ops::Not;
 
 #[cfg(feature = "defmt")]
@@ -18,14 +13,11 @@ use crate::Nvs;
 use crate::blob::{
     BlobIndex,
     BlobIndexEntryBlobIndexData,
-    BlobObservedData,
-    ChunkData,
 };
 use crate::error::Error;
 use crate::page::{
     ItemHashListEntry,
     LoadPageResult,
-    Namespace,
     ThinPage,
     ThinPageState,
 };
@@ -34,13 +26,14 @@ use crate::platform::Platform;
 use crate::raw::slice_with_nullbytes_to_str;
 use crate::raw::{
     ENTRIES_PER_PAGE,
+    ENTRY_STATE_BITMAP_SIZE,
     EntryMapState,
     FLASH_SECTOR_SIZE,
+    ITEM_SIZE,
     Item,
     ItemType,
-    PageHeader,
-    RawPage,
-    sanitize_item_type,
+    PAGE_HEADER_SIZE,
+    PageHeaderRaw,
 };
 use crate::types::{
     ChunkIndex,
@@ -141,28 +134,9 @@ where
         let sectors = self.sectors as usize;
         for sector_idx in 0..sectors {
             let sector_addr = self.base_address + sector_idx * FLASH_SECTOR_SIZE;
-            match self.load_sector(sector_addr)? {
+            match self.load_sector(sector_addr, &mut blob_index)? {
                 LoadPageResult::Empty(page) => self.free_pages.push(page),
-                LoadPageResult::Used(page, new_namespaces, new_blob_index) => {
-                    self.pages.push(page);
-                    new_namespaces.into_iter().for_each(|ns| {
-                        self.namespaces.insert(ns.name, ns.index);
-                    });
-                    new_blob_index.into_iter().for_each(|(key, val)| {
-                        match blob_index.get_mut(&key) {
-                            Some(existing) => {
-                                if let Some(index) = val.0 {
-                                    existing.0 = Some(index);
-                                }
-                                // Merge chunks from this page into the existing data
-                                existing.1.chunks_by_page.extend(val.1.chunks_by_page);
-                            }
-                            None => {
-                                blob_index.insert(key, val);
-                            }
-                        }
-                    })
-                }
+                LoadPageResult::Used(page) => self.pages.push(page),
             };
         }
 
@@ -174,7 +148,14 @@ where
         Ok(blob_index)
     }
 
-    pub(crate) fn load_sector(&mut self, sector_address: usize) -> Result<LoadPageResult, Error> {
+    /// Loads the sector at `sector_address`. The namespaces found on it go straight into
+    /// `self.namespaces` and what it holds of blobs into `blob_index`, which collects them across
+    /// all sectors.
+    pub(crate) fn load_sector(
+        &mut self,
+        sector_address: usize,
+        blob_index: &mut BlobIndex,
+    ) -> Result<LoadPageResult, Error> {
         #[cfg(feature = "defmt")]
         trace!("load_sector: @{:#08x}", sector_address);
 
@@ -186,7 +167,20 @@ where
             .read(sector_address as _, &mut buf)
             .map_err(|_| Error::FlashError)?;
 
-        if buf[..size_of::<PageHeader>()] == [0xFFu8; size_of::<PageHeader>()] {
+        // The sector is split into its parts once, rather than each being sliced out of `buf` where
+        // it is used. Everything below is read out of `buf` in place: reinterpreting the whole
+        // sector as a `RawPage` took two more copies of it, one to sanitize the item types and the
+        // transmuted page itself, which tripled what loading a sector costs on the stack.
+        const { assert!(PAGE_HEADER_SIZE + ENTRY_STATE_BITMAP_SIZE + ENTRIES_PER_PAGE * ITEM_SIZE == FLASH_SECTOR_SIZE) };
+        let (header_bytes, rest) = buf
+            .split_first_chunk::<PAGE_HEADER_SIZE>()
+            .expect("a sector holds a page header");
+        let (entry_state_bitmap, entries) = rest
+            .split_first_chunk::<ENTRY_STATE_BITMAP_SIZE>()
+            .expect("a sector holds an entry state bitmap");
+        let (entries, _) = entries.as_chunks::<ITEM_SIZE>();
+
+        if *header_bytes == [0xFFu8; PAGE_HEADER_SIZE] {
             #[cfg(feature = "debug-logs")]
             println!("  raw: load page: 0x{sector_address:04X} -> uninitialized");
 
@@ -201,29 +195,20 @@ where
             return Ok(LoadPageResult::Empty(page));
         }
 
-        // The items are reinterpreted from raw flash, so their type bytes have to be valid first,
-        // see `Item::from_raw`. `buf` itself keeps the bytes as they are on flash.
-        let mut sanitized = buf;
-        sanitized[offset_of!(RawPage, items)..]
-            .as_chunks_mut::<{ size_of::<Item>() }>()
-            .0
-            .iter_mut()
-            .for_each(sanitize_item_type);
-
-        // Safety: either we return directly CORRUPT/INVALID/EMPTY page or we check the crc
-        // afterwards
-        let raw_page: RawPage = unsafe { core::mem::transmute(sanitized) };
+        // Safety: the header is plain old data. It is either returned as a CORRUPT/INVALID/EMPTY
+        // page directly or its CRC is checked below.
+        let header = unsafe { PageHeaderRaw { raw: *header_bytes }.page_header };
 
         #[cfg(feature = "debug-logs")]
         {
-            let state = crate::raw::PageState::from(raw_page.header.state);
+            let state = crate::raw::PageState::from(header.state);
             println!("  raw: load page: 0x{sector_address:04X} -> {state}");
         }
 
         let mut page = ThinPage {
             address: sector_address,
-            header: raw_page.header.into(),
-            entry_state_bitmap: raw_page.entry_state_bitmap,
+            header: header.into(),
+            entry_state_bitmap: *entry_state_bitmap,
             erased_entry_count: 0,
             used_entry_count: 0,
             item_hash_list: vec![],
@@ -246,19 +231,24 @@ where
             ThinPageState::Full => (),
         }
 
-        if raw_page.header.crc != raw_page.header.calculate_crc32(T::crc32) {
+        if header.crc != header.calculate_crc32(T::crc32) {
             page.header.state = ThinPageState::Corrupt;
             return Ok(LoadPageResult::Empty(page));
         };
 
-        let mut blob_index = BlobIndex::new();
+        // Grown one push at a time, the list would end up with up to twice the room it needs, and
+        // a page that takes no more writes never uses that room. The active page is left to grow,
+        // as its list does with every write.
+        if page.header.state != ThinPageState::Active {
+            page.item_hash_list.reserve_exact(page.hashed_item_bound(entries));
+        }
 
-        // Needed due to the desugaring below
-        let mut namespaces: Vec<Namespace> = vec![];
         // This iterator desugaring is necessary to be able to skip entries, e.g. a BLOB or STR
         // entries are followed by entries containing their raw value.
-        let items = &raw_page.items;
-        let mut item_iter = unsafe { items.entries.iter().zip(u8::MIN..u8::MAX) };
+        //
+        // Each entry is copied out of `buf` on its own, which is also where its type byte is
+        // sanitized, see `Item::from_raw`. `buf` itself keeps the bytes as they are on flash.
+        let mut item_iter = entries.iter().map(|raw| Item::from_raw(*raw)).zip(u8::MIN..u8::MAX);
         'item_iter: while let Some((item, item_index)) = item_iter.next() {
             let state = page.get_entry_state(item_index);
 
@@ -282,11 +272,7 @@ where
                     continue 'item_iter;
                 }
                 EntryMapState::Empty => {
-                    let entry_offset = offset_of!(RawPage, items) + item_index as usize * size_of::<Item>();
-                    if buf[entry_offset..entry_offset + size_of::<Item>()]
-                        .iter()
-                        .all(|it| *it == 0xFF)
-                    {
+                    if entries[item_index as usize].iter().all(|it| *it == 0xFF) {
                         continue 'item_iter;
                     }
 
@@ -323,7 +309,7 @@ where
                         ItemType::Sized | ItemType::BlobData | ItemType::Blob => {
                             #[cfg(feature = "debug-logs")]
                             println!("encountered valid but EMPTY variable sized item at {item_index}");
-                            let data_is_valid = match page.load_referenced_data(&mut self.hal, item_index, item) {
+                            let data_is_valid = match page.load_referenced_data(&mut self.hal, item_index, &item) {
                                 Ok(data) => T::crc32(u32::MAX, &data) == unsafe { item.data.sized.crc },
                                 Err(Error::CorruptedData) => false,
                                 Err(e) => return Err(e),
@@ -418,10 +404,7 @@ where
             println!("item: {:?}", item);
 
             if item.namespace_index == 0 {
-                namespaces.push(Namespace {
-                    name: item.key,
-                    index: unsafe { item.data.raw[0] },
-                });
+                self.namespaces.insert(item.key, unsafe { item.data.raw[0] });
                 continue 'item_iter;
             }
 
@@ -433,64 +416,17 @@ where
                 };
 
                 let key = (NamespaceIndex(item.namespace_index), chunk_start, item.key);
-                let existing = blob_index.get_mut(&key);
-                if let Some(existing) = existing {
-                    if item.type_ == ItemType::BlobIndex {
-                        existing.0 = Some(BlobIndexEntryBlobIndexData {
-                            item_index,
-                            page_sequence: page.header.sequence,
-                            size: unsafe { item.data.blob_index.size },
-                            chunk_count: unsafe { item.data.blob_index.chunk_count },
-                        });
-                    } else {
-                        // Add this chunk to the page-specific tracking
-                        let chunk_size = unsafe { item.data.sized.size } as u32;
-                        let page_seq = page.header.sequence;
-
-                        // Check if we already have chunks from this page
-                        if let Some(entry) = existing
-                            .1
-                            .chunks_by_page
-                            .iter_mut()
-                            .find(|chunk| chunk.page_sequence == page_seq)
-                        {
-                            entry.chunk_count += 1;
-                            entry.data_size += chunk_size;
-                        } else {
-                            existing.1.chunks_by_page.push(ChunkData {
-                                page_sequence: page_seq,
-                                chunk_count: 1,
-                                data_size: chunk_size,
-                            });
-                        }
-                    }
-                } else if item.type_ == ItemType::BlobIndex {
-                    blob_index.insert(
-                        key,
-                        (
-                            Some(BlobIndexEntryBlobIndexData {
-                                item_index,
-                                page_sequence: page.header.sequence,
-                                size: unsafe { item.data.blob_index.size },
-                                chunk_count: unsafe { item.data.blob_index.chunk_count },
-                            }),
-                            BlobObservedData { chunks_by_page: vec![] },
-                        ),
-                    );
+                let (index, observed) = blob_index.entry(key).or_default();
+                if item.type_ == ItemType::BlobIndex {
+                    *index = Some(BlobIndexEntryBlobIndexData {
+                        item_index,
+                        page_sequence: page.header.sequence,
+                        size: unsafe { item.data.blob_index.size },
+                        chunk_count: unsafe { item.data.blob_index.chunk_count },
+                    });
                 } else {
-                    blob_index.insert(
-                        key,
-                        (
-                            None,
-                            BlobObservedData {
-                                chunks_by_page: vec![ChunkData {
-                                    page_sequence: page.header.sequence,
-                                    chunk_count: 1,
-                                    data_size: unsafe { item.data.sized.size } as u32,
-                                }],
-                            },
-                        ),
-                    );
+                    observed.chunk_count += 1;
+                    observed.data_size += unsafe { item.data.sized.size } as u64;
                 }
             }
 
@@ -540,6 +476,6 @@ where
         #[cfg(feature = "debug-logs")]
         println!("PGE {page:?}");
 
-        Ok(LoadPageResult::Used(page, namespaces, blob_index))
+        Ok(LoadPageResult::Used(page))
     }
 }

@@ -38,6 +38,7 @@ use crate::raw::{
     ENTRIES_PER_PAGE,
     ENTRY_STATE_BITMAP_SIZE,
     EntryMapState,
+    ITEM_SIZE,
     Item,
     ItemData,
     ItemType,
@@ -375,17 +376,46 @@ impl ThinPage {
         item_index: u8,
         item: &Item,
     ) -> Result<Vec<u8>, Error> {
-        #[cfg(feature = "defmt")]
-        trace!(
-            "load_referenced_data: @{:#08x}[{}-{}]",
-            self.address,
-            item_index + 1,
-            item_index + item.span
-        );
+        let size = Self::referenced_data_size(item_index, item)?;
+        let aligned_size = T::align_read(size);
 
-        #[cfg(feature = "debug-logs")]
-        println!("internal: load_item_data");
+        let mut buf = Vec::with_capacity(aligned_size);
+        // Safety: we just allocated the buffer with the exact size we need and we will override it
+        // the the call to hal.read()
+        unsafe {
+            Vec::set_len(&mut buf, aligned_size);
+        }
+        self.read_referenced_data::<T>(hal, item_index, size, &mut buf)?;
 
+        // Safety: we allocated aligned_size bytes which is always more than size
+        unsafe {
+            Vec::set_len(&mut buf, size);
+        }
+
+        Ok(buf)
+    }
+
+    /// Reads the data `item` references to the start of `out`, returning its length.
+    ///
+    /// `out` needs room for the data rounded up to the read size of the flash; the bytes past the
+    /// data are overwritten with whatever follows it on flash. Reading in place like this spares
+    /// the caller a buffer of its own for each chunk of a blob.
+    pub(crate) fn load_referenced_data_into<T: Platform>(
+        &self,
+        hal: &mut T,
+        // this is the index of the given &Item, not the start of the data which is +1
+        item_index: u8,
+        item: &Item,
+        out: &mut [u8],
+    ) -> Result<usize, Error> {
+        let size = Self::referenced_data_size(item_index, item)?;
+        let out = out.get_mut(..T::align_read(size)).ok_or(Error::CorruptedData)?;
+        self.read_referenced_data::<T>(hal, item_index, size, out)?;
+        Ok(size)
+    }
+
+    /// The size of the data `item` references, checked to lie inside this page.
+    fn referenced_data_size(item_index: u8, item: &Item) -> Result<usize, Error> {
         match item.type_ {
             ItemType::Sized | ItemType::BlobData | ItemType::Blob => {}
             _ => return Err(ItemTypeMismatch(item.type_)),
@@ -410,26 +440,37 @@ impl ThinPage {
             return Err(Error::CorruptedData);
         }
 
-        let aligned_size = T::align_read(size);
+        Ok(size)
+    }
 
-        let mut buf = Vec::with_capacity(aligned_size);
-        // Safety: we just allocated the buffer with the exact size we need and we will override it
-        // the the call to hal.read()
-        unsafe {
-            Vec::set_len(&mut buf, aligned_size);
-        }
+    /// Reads `out`, which is the data of `size` bytes rounded up to the read size, from behind the
+    /// item at `item_index`.
+    fn read_referenced_data<T: Platform>(
+        &self,
+        hal: &mut T,
+        item_index: u8,
+        size: usize,
+        out: &mut [u8],
+    ) -> Result<(), Error> {
+        #[cfg(feature = "defmt")]
+        trace!(
+            "load_referenced_data: @{:#08x}[{}]: {}",
+            self.address,
+            item_index + 1,
+            size
+        );
+
+        #[cfg(feature = "debug-logs")]
+        println!("internal: load_item_data: {size}");
+
+        #[cfg(not(any(feature = "defmt", feature = "debug-logs")))]
+        let _ = size;
+
         hal.read(
             (self.address + offset_of!(RawPage, items) + size_of::<Item>() * (item_index as usize + 1)) as _,
-            &mut buf,
+            out,
         )
-        .map_err(|_| Error::FlashError)?;
-
-        // Safety: we allocated aligned_size bytes which is always more than size
-        unsafe {
-            Vec::set_len(&mut buf, size);
-        }
-
-        Ok(buf)
+        .map_err(|_| Error::FlashError)
     }
 
     pub(crate) fn set_entry_state<T: Platform>(
@@ -509,6 +550,38 @@ impl ThinPage {
             &self.entry_state_bitmap[aligned_start_byte..aligned_end_byte],
         )
         .map_err(|_| Error::FlashError)
+    }
+
+    /// How many entries of the hash list the scan of a page holding `entries` will push: one per
+    /// item header marked written in the entry map, namespace entries aside, found by walking from
+    /// header to header by their spans the way the scan does.
+    ///
+    /// It is a capacity to reserve, not a count to rely on. The scan erases what fails its CRC,
+    /// which makes this an overestimate, and recovers complete items it finds behind entries still
+    /// marked empty, which this does not count; the list grows past it then.
+    pub(crate) fn hashed_item_bound(&self, entries: &[[u8; ITEM_SIZE]]) -> usize {
+        let mut bound = 0;
+        let mut index = 0;
+        while index < ENTRIES_PER_PAGE {
+            if self.get_entry_state(index as u8) != EntryMapState::Written {
+                index += 1;
+                continue;
+            }
+
+            // Namespace index and span, the first and third byte of an item.
+            let [namespace_index, _, span, ..] = entries[index];
+            if namespace_index != 0 {
+                bound += 1;
+            }
+
+            let span = span as usize;
+            index += if span >= 1 && index + span <= ENTRIES_PER_PAGE {
+                span
+            } else {
+                1
+            };
+        }
+        bound
     }
 
     pub(crate) fn get_next_free_entry(&self) -> usize {
@@ -761,14 +834,8 @@ pub(crate) struct ItemHashListEntry {
     pub(crate) index: u8,
 }
 
-/// Namespace definition loaded from flash.
-pub(crate) struct Namespace {
-    pub(crate) name: Key,
-    pub(crate) index: u8,
-}
-
 /// Result of loading a page from flash.
 pub(crate) enum LoadPageResult {
     Empty(ThinPage),
-    Used(ThinPage, Vec<Namespace>, crate::blob::BlobIndex),
+    Used(ThinPage),
 }
