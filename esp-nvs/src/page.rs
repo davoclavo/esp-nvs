@@ -377,20 +377,12 @@ impl ThinPage {
         item: &Item,
     ) -> Result<Vec<u8>, Error> {
         let size = Self::referenced_data_size(item_index, item)?;
-        let aligned_size = T::align_read(size);
 
-        let mut buf = Vec::with_capacity(aligned_size);
-        // Safety: we just allocated the buffer with the exact size we need and we will override it
-        // the the call to hal.read()
-        unsafe {
-            Vec::set_len(&mut buf, aligned_size);
-        }
+        // Zeroed rather than left uninitialized: `hal.read` takes it as a `&mut [u8]`, which must
+        // not cover uninitialized memory.
+        let mut buf = vec![0u8; T::align_read(size)];
         self.read_referenced_data::<T>(hal, item_index, size, &mut buf)?;
-
-        // Safety: we allocated aligned_size bytes which is always more than size
-        unsafe {
-            Vec::set_len(&mut buf, size);
-        }
+        buf.truncate(size);
 
         Ok(buf)
     }
