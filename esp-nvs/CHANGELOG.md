@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.3] - 2026-10-22
+
+### Bug Fixes
+
+- *(esp-nvs)* Read referenced data into an initialized buffer
+
+### Performance
+
+- *(esp-nvs)* Stop copying sectors and items while loading a partition
+
+### Testing
+
+- *(esp-nvs)* Measure the stack and heap used to load and read
+
+
 ## [0.6.2] - 2026-10-06
 
 ### Bug Fixes
