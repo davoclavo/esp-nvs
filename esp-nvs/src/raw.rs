@@ -1,6 +1,5 @@
 #[cfg(feature = "debug-logs")]
 use alloc::format;
-use alloc::vec;
 use core::fmt::{
     Debug,
     Formatter,
@@ -433,9 +432,14 @@ pub(crate) fn write_aligned<T: Platform>(hal: &mut T, offset: u32, bytes: &[u8])
         // no need to write the trailer if remaining data is all ones - this the default state of
         // the flash
         if bytes[pivot..].iter().any(|&e| e != 0xFF) {
-            let mut buf = vec![0xFFu8; T::WRITE_SIZE];
+            // The trailer is padded to a whole write on the stack rather than allocating for every
+            // unaligned write. A write never exceeds an entry: with a larger write size, writing an
+            // item or a range of the entry map would program its neighbours as well.
+            const { assert!(T::WRITE_SIZE <= ITEM_SIZE, "flash write size larger than an entry") };
+            let mut buf = [0xFFu8; ITEM_SIZE];
+            let buf = &mut buf[..T::WRITE_SIZE];
             buf[..trailer.len()].copy_from_slice(trailer);
-            hal.write(offset + (pivot as u32), &buf)?
+            hal.write(offset + (pivot as u32), buf)?
         }
 
         Ok(())

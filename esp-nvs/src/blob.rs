@@ -4,7 +4,6 @@
 //! blob storage in NVS.
 
 use alloc::collections::BTreeMap;
-use alloc::vec::Vec;
 
 use crate::Key;
 use crate::types::{
@@ -22,18 +21,13 @@ pub(crate) type BlobIndexValue = (Option<BlobIndexEntryBlobIndexData>, BlobObser
 /// Since we clean up on init, there are at most two.
 pub(crate) type BlobIndex = BTreeMap<BlobIndexKey, BlobIndexValue>;
 
-/// Data about chunks observed on a specific page.
-#[cfg_attr(feature = "debug-logs", derive(Debug))]
-pub(crate) struct ChunkData {
-    pub(crate) page_sequence: u32,
-    pub(crate) chunk_count: u8,
-    pub(crate) data_size: u32,
-}
-
-/// Observed blob data chunks across pages.
+/// The blob data chunks observed across all pages, summed up. Summed wide, so that a corrupt count
+/// cannot overflow.
+#[derive(Default)]
 #[cfg_attr(feature = "debug-logs", derive(Debug))]
 pub(crate) struct BlobObservedData {
-    pub(crate) chunks_by_page: Vec<ChunkData>,
+    pub(crate) chunk_count: u32,
+    pub(crate) data_size: u64,
 }
 
 /// Blob index entry metadata from the BlobIndex item.

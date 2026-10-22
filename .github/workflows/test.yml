@@ -38,6 +38,9 @@ jobs:
       # https://github.com/rust-lang/cargo/issues/6669
       - name: cargo test --doc
         run: cargo test --locked --workspace --doc
+      # The memory benchmarks only check their bounds in release, which a debug build would exceed.
+      - name: cargo test --release --test memory
+        run: cargo test --locked --release --package esp-nvs --test memory -- --nocapture --test-threads=1
   os-check:
     # run cargo test on mac and windows
     runs-on: ${{ matrix.os }}

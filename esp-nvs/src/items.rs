@@ -3,10 +3,7 @@
 //! This module contains the internal implementation for reading, writing,
 //! and deleting items (primitives, strings, blobs) from NVS storage.
 
-use alloc::string::{
-    String,
-    ToString,
-};
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp;
@@ -98,23 +95,21 @@ where
         }
 
         let page = &self.pages[page_index.0];
-        let data = page.load_referenced_data(&mut self.hal, item_index.0, &item)?;
+        let mut data = page.load_referenced_data(&mut self.hal, item_index.0, &item)?;
 
         let crc = unsafe { item.data.sized.crc };
         if crc != T::crc32(u32::MAX, &data) {
             return Err(Error::KeyNotFound);
         }
 
-        // A stored string always carries its null terminator, so an empty payload means the size on
-        // flash is corrupt. Without this the slice below underflows: a panic in debug, and in
-        // release a wrapped `usize::MAX` length that panics on the slice instead. Neither is
-        // something a `get` should do to the caller.
-        if data.is_empty() {
+        // A stored string always carries its null terminator, which is not part of the value. An
+        // empty payload has none, so the size on flash is corrupt.
+        if data.pop().is_none() {
             return Err(Error::CorruptedData);
         }
 
-        let str = core::str::from_utf8(&data[..data.len() - 1]).map_err(|_| Error::CorruptedData)?; // we don't want the null terminator
-        Ok(str.to_string())
+        // The buffer read from flash becomes the string, rather than being copied into a new one.
+        String::from_utf8(data).map_err(|_| Error::CorruptedData)
     }
 
     pub(crate) fn get_blob(&mut self, namespace: &Key, key: &Key) -> Result<Vec<u8>, Error> {
@@ -149,7 +144,12 @@ where
             // Both come straight from flash, so their sum can overflow on a corrupt index.
             let chunk_end = chunk_start.checked_add(chunk_count).ok_or(Error::CorruptedData)?;
 
-            let mut buf = vec![0u8; size as usize];
+            // Every chunk is read straight into place, which needs room for its read rounded up to
+            // the read size of the flash; the slack is overwritten by the next chunk and cut off at
+            // the end. Reading each chunk into a buffer of its own first, and copying it over from
+            // there, cost a chunk's worth of heap on top of the blob.
+            let size = size as usize;
+            let mut buf = vec![0u8; size + T::READ_SIZE];
             let mut offset = 0usize;
 
             for chunk in chunk_start..chunk_end {
@@ -166,29 +166,31 @@ where
                 }
 
                 let page = &self.pages[page_index.0];
-                let data = page.load_referenced_data(&mut self.hal, item_index.0, &item)?;
+                // The chunks hold more data than the index claims, so index and chunks disagree.
+                // Returning only the part that still fits would silently return a truncated blob.
+                // A chunk too large for the room left fails the read, one that only reaches into
+                // the slack the check after it.
+                let data_len =
+                    page.load_referenced_data_into(&mut self.hal, item_index.0, &item, &mut buf[offset..])?;
+                if offset + data_len > size {
+                    return Err(Error::CorruptedData);
+                }
 
                 let data_crc = unsafe { item.data.sized.crc };
-                if data_crc != T::crc32(u32::MAX, &data) {
+                if data_crc != T::crc32(u32::MAX, &buf[offset..offset + data_len]) {
                     return Err(Error::CorruptedData);
                 }
 
-                // The chunks hold more data than the index claims, so index and chunks disagree.
-                // Copying only the part that still fits would silently return a truncated blob.
-                if offset + data.len() > buf.len() {
-                    return Err(Error::CorruptedData);
-                }
-
-                buf[offset..offset + data.len()].copy_from_slice(&data);
-                offset += data.len();
+                offset += data_len;
             }
 
             // The chunks hold less data than the index claims; the tail of `buf` would still be
             // zero, which would silently return a zero padded blob.
-            if offset != buf.len() {
+            if offset != size {
                 return Err(Error::CorruptedData);
             }
 
+            buf.truncate(size);
             Ok(buf)
         } else if item.type_ == ItemType::Blob {
             // Legacy single-page blob (version 1 format) — same layout as Sized

@@ -14,6 +14,7 @@ use defmt::{
 use crate::blob::{
     BlobIndex,
     BlobIndexEntryBlobIndexData,
+    BlobObservedData,
 };
 use crate::error::Error;
 use crate::page::{
@@ -71,19 +72,7 @@ where
                 continue;
             };
 
-            // Calculate total chunks and data size from all observed chunks. Summed wide, so that a
-            // corrupt count cannot overflow.
-            let (chunk_count, data_size) =
-                observed
-                    .chunks_by_page
-                    .iter()
-                    .fold((0u32, 0u64), |(count, size), chunk_data| {
-                        (
-                            count + chunk_data.chunk_count as u32,
-                            size + chunk_data.data_size as u64,
-                        )
-                    });
-
+            let BlobObservedData { chunk_count, data_size } = observed;
             if index.chunk_count as u32 != chunk_count || index.size as u64 != data_size {
                 #[cfg(feature = "debug-logs")]
                 println!(
@@ -349,30 +338,35 @@ where
         #[cfg(feature = "debug-logs")]
         println!("internal: cleanup_duplicate_entries");
 
-        // Build a map of hash (as u32) -> Vec<(page_index, item_index, page_sequence)>
-        // Use the hash as a quick filter - duplicates will have the same hash
-        let mut hash_to_item: BTreeMap<u24, Vec<(PageIndex, ItemIndex, PageSequence)>> = BTreeMap::new();
-
+        // Every item on the partition, by hash. Duplicates share their hash, so only runs of equal
+        // hashes need a closer look. A flat list sorted by hash costs one allocation of six bytes
+        // per item; a map of lists, one per hash, cost an allocation per item and many times the
+        // memory, at the point in `Nvs::new` where the heap is needed most.
+        //
+        // The page index fits a u16, `Nvs::new` refuses partitions with more sectors. Sorting by
+        // page and item after the hash keeps a run in the order of pages and items, as the map had
+        // it, and the unstable sort needs no scratch buffer, which the stable one puts on the
+        // stack.
+        let mut by_hash: Vec<(u24, u16, u8)> =
+            Vec::with_capacity(self.pages.iter().map(|page| page.item_hash_list.len()).sum());
         for (page_idx, page) in self.pages.iter().enumerate() {
             for hash_entry in &page.item_hash_list {
-                hash_to_item.entry(hash_entry.hash).or_default().push((
-                    PageIndex(page_idx),
-                    ItemIndex(hash_entry.index),
-                    PageSequence(page.header.sequence),
-                ));
+                by_hash.push((hash_entry.hash, page_idx as u16, hash_entry.index));
             }
         }
+        by_hash.sort_unstable();
 
-        for (_hash, entries) in hash_to_item {
+        for entries in by_hash.chunk_by(|(a, _, _), (b, _, _)| a == b) {
             if entries.len() <= 1 {
                 continue; // No duplicates for this hash
             }
 
             // Now we need to load items to check their full identity and type
             let mut items: Vec<_> = Vec::with_capacity(entries.len());
-            for (page_idx, item_index, page_seq) in entries {
-                let page = &self.pages[page_idx.0];
-                let item = page.load_item(&mut self.hal, item_index.0)?;
+            for &(_, page_idx, item_index) in entries {
+                let page = &self.pages[page_idx as usize];
+                let page_seq = PageSequence(page.header.sequence);
+                let item = page.load_item(&mut self.hal, item_index)?;
 
                 // Skip namespace entries (namespace_index == 0) and blob data. Namespace entries
                 // are special and should not be cleaned up, and chunks go with
@@ -395,7 +389,13 @@ where
                 };
                 items.push((
                     (NamespaceIndex(item.namespace_index), item.key),
-                    (page_idx, item_index, page_seq, item.span, blob_version),
+                    (
+                        PageIndex(page_idx as usize),
+                        ItemIndex(item_index),
+                        page_seq,
+                        item.span,
+                        blob_version,
+                    ),
                 ));
             }
 
