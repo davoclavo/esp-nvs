@@ -911,3 +911,36 @@ fn an_image_with_an_empty_gap_left_by_0_5_0_can_be_written() {
     let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
     check(&mut nvs);
 }
+
+/// Namespace definitions are not in a page's item hash list. A `Freeing` page whose only live item
+/// is one used to pass for completely copied, with nothing to compare, and was erased; every key
+/// of the namespace then lost its name.
+#[test]
+fn a_freeing_page_that_holds_only_a_namespace_definition_keeps_it() {
+    let flash = common::SharedFlash::new(4);
+    {
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), flash.clone()).unwrap();
+        // Page 0: the namespace definition and 125 keys.
+        for i in 0..125u32 {
+            nvs.set(&namespace(), &Key::from_str(&format!("k{i}")), i).unwrap();
+        }
+        // Page 1, filled exactly: new values of all 125 keys and one more, so no page is left
+        // `Active` and page 0 holds nothing live but the namespace definition.
+        for i in 0..126u32 {
+            nvs.set(&namespace(), &Key::from_str(&format!("k{i}")), i + 1000)
+                .unwrap();
+        }
+    }
+    flash.with_buf(|buf| mark_freeing(buf, 0));
+
+    for boot in 0..2 {
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), flash.clone()).unwrap();
+        for i in 0..126u32 {
+            assert_eq!(
+                nvs.get::<u32>(&namespace(), &Key::from_str(&format!("k{i}"))),
+                Ok(i + 1000),
+                "boot {boot}, k{i}"
+            );
+        }
+    }
+}

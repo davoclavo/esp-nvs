@@ -303,6 +303,35 @@ where
             return Ok(false);
         }
 
+        // Namespace definitions are not in `item_hash_list`, so they are compared entry by entry.
+        // Without this, a source whose only live items are namespace definitions passes vacuously,
+        // is erased, and takes every key of those namespaces with it.
+        for source_index in 0..ENTRIES_PER_PAGE as u8 {
+            if source.get_entry_state(source_index) != EntryMapState::Written {
+                continue;
+            }
+            let Ok(item) = source.load_item(&mut self.hal, source_index) else {
+                continue;
+            };
+            if item.namespace_index != 0 {
+                continue;
+            }
+            let mut found = false;
+            for index in 0..ENTRIES_PER_PAGE as u8 {
+                if newest.get_entry_state(index) == EntryMapState::Written
+                    && let Ok(candidate) = newest.load_item(&mut self.hal, index)
+                    && candidate.namespace_index == 0
+                    && candidate.key == item.key
+                {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                return Ok(false);
+            }
+        }
+
         for source_entry in &source.item_hash_list {
             let Ok(item) = source.load_item(&mut self.hal, source_entry.index) else {
                 continue;
